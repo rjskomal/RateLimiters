@@ -1,10 +1,17 @@
 const express = require('express');
 const fwRateLimiter = require('./fwRateLimiter');
+const tbRateLimiter = require('./tbRateLimiter');
 
 const app = express();
-const rateLimiter = fwRateLimiter(5, 10);
+const fwLimiter = fwRateLimiter(5, 10);
+const tbLimiter = tbRateLimiter(5, 2);
 
-app.get('/', rateLimiter, (req, res) => {
+app.get('/fw', fwLimiter, (req, res) => {
+  const { clientID } = req.query;
+  res.send(`Hello ${clientID}`);
+});
+
+app.get('/tb', tbLimiter, (req, res) => {
   const { clientID } = req.query;
   res.send(`Hello ${clientID}`);
 });
