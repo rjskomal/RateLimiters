@@ -33,6 +33,30 @@ curl "http://localhost:3000/tb?clientID=user1"
 
 ![Rate Limiters](./assets/tbTL.png)
 
+---
+
+## Observation: Fractional Token Accumulation
+
+The token bucket implementation was refined to allow fractional tokens to accumulate over time. Instead of truncating with `Math.floor()`, the algorithm now maintains precise sub-token values between requests.
+
+**What changed:**
+```javascript
+// Before:
+const tokensToAdd = Math.floor(elapsedTime * (refillRate / 1000));
+
+// After:
+const tokensToAdd = (elapsedTime * (refillRate / 1000));
+```
+
+**Why it matters:** This creates smoother rate limiting. With fractional accumulation, short intervals (e.g., 150ms) contribute partial tokens that compound over time, rather than being discarded. Only when total tokens ≥ 1.0 is a full request allowed (checked via `if (user.totalTokens > 1)`).
+
+**Visual example:**
+![Token Bucket with Fractional Accumulation](./assets/tbTL_fractional_tokens.png)
+
+The output shows tokens accumulating as decimals (3.62..., 2.53..., 1.84...) until depleted, then refilling gradually.
+
+---
+
 ## Running
 
 ```bash

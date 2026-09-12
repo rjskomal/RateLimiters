@@ -18,11 +18,11 @@ function tbRateLimiter(bucketSize, refillRate) {
 
        
         const elapsedTime = now - user.lastRefillTime;
-        const tokensToAdd = Math.floor(elapsedTime * (refillRate / 1000));
+        const tokensToAdd = (elapsedTime * (refillRate / 1000));
         user.totalTokens = Math.min(user.totalTokens + tokensToAdd, bucketSize);
         user.lastRefillTime = now;
 
-        if (user.totalTokens > 0) {
+        if (user.totalTokens > 1) {
             console.log(`Total tokens available now for ${clientID} = ${user.totalTokens}`);
             user.totalTokens -= 1;
 
