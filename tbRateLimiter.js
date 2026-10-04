@@ -26,6 +26,4 @@ function tbRateLimiter(bucketSize, refillRate) {
         }
     };
 }
-
-module.exports = tbRateLimiter;
 module.exports = tbRateLimiter;
