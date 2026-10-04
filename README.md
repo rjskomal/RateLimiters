@@ -48,7 +48,7 @@ const tokensToAdd = Math.floor(elapsedTime * (refillRate / 1000));
 const tokensToAdd = (elapsedTime * (refillRate / 1000));
 ```
 
-**Why it matters:** This creates smoother rate limiting. With fractional accumulation, short intervals (e.g., 150ms) contribute partial tokens that compound over time, rather than being discarded. Only when total tokens ≥ 1.0 is a full request allowed (checked via `if (user.totalTokens > 1)`).
+**Why it matters:** This creates smoother rate limiting. With fractional accumulation, short intervals (e.g., 150ms) contribute partial tokens that compound over time, rather than being discarded. A request is allowed when total tokens are at least 1.0, i.e. `if (user.totalTokens >= 1)` in the logic and the Redis Lua script equivalent.
 
 **Visual example:**
 ![Token Bucket with Fractional Accumulation](./assets/tbTL_fractional_tokens.png)
