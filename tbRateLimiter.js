@@ -9,35 +9,17 @@ function tbRateLimiter(bucketSize, refillRate) {
         }
 
         try {
-            const now = Date.now();
-            
-            // Get or initialize user state from Redis
-            let user = await sharedStore.getUserState(clientID);
-            if (!user) {
-                await sharedStore.initializeUserIfNotExists(clientID, bucketSize, now);
-                user = { totalTokens: bucketSize, lastRefillTime: now };
-            }
+            const { allowed, tokensRemaining } = await sharedStore.rateLimitCheck(clientID, bucketSize, refillRate);
 
-            // Calculate tokens to add based on elapsed time
-            const elapsedTime = now - user.lastRefillTime;
-            const tokensToAdd = (elapsedTime * (refillRate / 1000));
-            user.totalTokens = Math.min(user.totalTokens + tokensToAdd, bucketSize);
-            user.lastRefillTime = now;
-
-            if (user.totalTokens >= 1) {
-                console.log(`Total tokens available now for ${clientID} = ${user.totalTokens}`);
-                user.totalTokens -= 1;
-
-                // Persist updated state to Redis
-                await sharedStore.setUserState(clientID, user.totalTokens, user.lastRefillTime);
-
+            if (allowed) {
+                console.log(`Total tokens available now for ${clientID} = ${tokensRemaining}`);
                 return next();
             }
 
             console.log(`[${clientID}] Rate limit exceeded! Bucket is empty, wait a second to refill.`);
             return res
                 .status(429)
-                .send(`Rate limit exceeded. Try again later.`);
+                .send('Rate limit exceeded. Try again later.');
         } catch (err) {
             console.error(`Rate limiter error for ${clientID}:`, err);
             return res.status(500).send('Internal server error');
@@ -45,4 +27,5 @@ function tbRateLimiter(bucketSize, refillRate) {
     };
 }
 
+module.exports = tbRateLimiter;
 module.exports = tbRateLimiter;

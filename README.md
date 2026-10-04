@@ -67,7 +67,7 @@ That behavior is effectively atomic for a single server instance. It does not wo
 
 ### 2. Making the state distributed
 
-The token-bucket limiter now keeps user state in a shared Redis store instead of process memory. Both application instances use the same key for a client:
+The token-bucket limiter keeps each client's state in Redis, shared by both application instances. Both servers use the same key for a client:
 
 ```text
 rate-limiter:<clientID>
@@ -80,16 +80,17 @@ totalTokens
 lastRefillTime
 ```
 
-The middleware in `tbRateLimiter.js` reads the hash, calculates refill and consumption, and writes the updated state back through `sharedStore.js`. Since both servers use the same Redis key, a request received by either server observes the state left by the other server.
+The middleware calls `rateLimitCheck()` in `sharedStore.js`, which sends the token-bucket Lua script to Redis with one `EVAL` command. Redis stores `totalTokens` and `lastRefillTime` in the client's hash. Both servers therefore read and update the same bucket, rather than maintaining independent process-local copies.
 
 ### 3. How Redis and `sharedStore.js` are used
 
 `sharedStore.js` owns the Redis client and exposes a small storage API:
 
-- `getUserState(clientID)` reads the user's hash with `HGETALL`.
-- `setUserState(clientID, totalTokens, lastRefillTime)` writes the hash with `HSET`.
-- `initializeUserIfNotExists(...)` creates the initial bucket state when no hash exists.
+- `rateLimitCheck(clientID, bucketSize, refillRate)` invokes `scripts/tokenBucketCheck.lua` using Redis `EVAL`.
+- The Lua script reads and updates the hash fields `totalTokens` and `lastRefillTime`, decides whether to allow the request, and sets the key's expiry.
 - Connection, read, write, and Redis memory logs make the shared state visible during testing.
+
+The older `getUserState()` and `setUserState()` helpers are still exported, but the active `/tb` request path uses the atomic Lua operation instead.
 
 The two running servers can be verified by alternating requests for the same client:
 
@@ -104,20 +105,116 @@ Both terminals should log reads and writes for `rate-limiter:user1`. The token c
 
 ![Shared Redis state across two servers](./assets/sharedStore.png)
 
-### 4. The new atomicity problem and the trade-off
+### 4. Atomic updates across distributed application instances
 
-Redis gives the replicas a common source of truth, but the current token-bucket update is not one atomic Redis operation. It is a sequence of `HGETALL`, local calculation, and `HSET` commands. If two replicas handle requests for the same user at the same time, both can read the same token count, both can approve a request, and the later write can overwrite the earlier write.
+The current `/tb` path avoids the earlier read/modify/write race. The application sends one `EVAL` command to Redis. The script performs the state read, refill calculation, token decision, state write, and expiry update without another Redis command interleaving in the middle. Redis serializes command execution, so two requests arriving from different application instances cannot both act on the same stale token count.
 
-This is the trade-off in the current implementation:
+Distribution is preserved because `server.js` and `Replica.js` both send the same client key to the same Redis service. The JavaScript middleware still awaits the result of `EVAL`; atomicity comes from doing the entire state transition inside one Redis-side script, not from avoiding `await` in Node.js.
 
-- Local memory provides simple, effectively atomic synchronous updates, but state is not shared between replicas.
-- Redis shares state between replicas, but separate read and write commands introduce a race under concurrent traffic.
+The script currently receives `Date.now()` from the application process. Lua keeps each update atomic, but clocks on separate machines can still differ; using Redis `TIME` inside the script would remove that cross-host clock-skew dependency.
 
-The usual next step is to move the read, refill calculation, limit check, and write into one Redis-side atomic operation, for example a Lua script or a Redis transaction with appropriate optimistic locking. That would preserve the distributed state while preventing lost updates.
+### 5. Redis key expiry and memory growth
 
-### 5. Remaining issue: the Redis store does not shrink yet
+The Lua script calls `EXPIRE` after every `/tb` check, including rejected requests. Its timeout is `ceil(bucketSize / refillRate) + 60` seconds. With the current bucket size of 5 and refill rate of 2 tokens per second, the key expires after 63 seconds without requests. A request refreshes that idle timeout, so a continuously active client retains its state while an inactive client's state is eventually removed.
 
-User hashes currently have no expiration or cleanup policy. Therefore, once `rate-limiter:userA` is created, it remains in Redis even if `userA` makes one request and does not return for 1,000 days. As the number of client IDs grows, the key count and memory usage can grow as well.
+This addresses indefinite retention for one-time clients. Expiry removes keys from the Redis keyspace and releases their data; the process's reported memory or operating-system RSS may not fall by exactly the same amount immediately because Redis and its allocator retain baseline and reusable memory. `DBSIZE`, `TTL`, and `INFO memory` help distinguish key expiry from allocator-level memory reporting.
+
+In the latest check, a test key had expired (`EXISTS` returned 0 and `TTL` returned -2), and `DBSIZE` was 0. Redis reported about 1.18 MB used, which is mostly server/runtime overhead at this tiny test scale. The 40-client test also showed finite TTLs (a sample had about 41 seconds remaining shortly after creation).
+
+### 6. What the Redis changes do, and what they do not
+
+#### Redis storage model
+
+Each client has one Redis hash named `rate-limiter:<clientID>`. The hash contains `totalTokens` and `lastRefillTime`. The Lua script creates the initial full bucket on a missing key, updates the token count for each request, and refreshes the key's expiry. Both application processes share this hash through Redis.
+
+#### Race prevention while remaining distributed
+
+The earlier approach used separate read, application-side calculation, and write commands. Concurrent requests could read the same old value and overwrite each other's updates. The Lua script now combines those operations into one atomic Redis execution. Both server processes remain distributed application instances; Redis is their shared coordination point. This removes the stale-read/lost-update race in the token-bucket state transition. The observed burst may include more than five allowed requests because tokens refill at 2 per second while requests are being processed; the script applies the refill rule on every request.
+
+#### Redis availability: still a single point of failure
+
+Redis is still a SPOF in this setup. The current Redis instance reports `role:master` and `connected_slaves:0`, and the application has no Redis failover configuration. If that Redis instance is unavailable, `/tb` cannot check the shared bucket and currently responds with HTTP 500. The Lua script solves atomicity; it does not provide Redis high availability.
+
+To reduce this availability risk later, deploy Redis with a replica and automatic failover, such as a managed Redis HA service or Redis Sentinel with a correctly configured replica and quorum. Redis Cluster is another option when sharding and cluster failover are needed. Application-local fallback is not equivalent: replicas would each enforce separate local buckets and could disagree about the global limit. A fallback policy must explicitly choose availability versus consistent enforcement.
+
+#### Reproduce the request checks
+
+Start the two application instances in separate terminals:
+
+```bash
+node server.js
+node Replica.js
+```
+
+Single requests to each instance:
+
+```bash
+curl -i "http://localhost:3000/tb?clientID=user1"
+curl -i "http://localhost:3001/tb?clientID=user1"
+```
+
+Twelve sequential requests, alternating servers:
+
+```bash
+for i in $(seq 1 12); do
+	if [ $((i % 2)) -eq 1 ]; then port=3000; instance=server.js; else port=3001; instance=Replica.js; fi
+	printf 'seq%02d %s ' "$i" "$instance"
+	curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' "http://localhost:$port/tb?clientID=audit-seq"
+done
+```
+
+One hundred concurrent requests split across the two instances:
+
+```bash
+seq 1 100 | xargs -P 100 -I{} sh -c 'if [ $(({} % 2)) -eq 1 ]; then port=3000; else port=3001; fi; curl --max-time 10 -sS -o /dev/null -w "%{http_code}\n" "http://localhost:${port}/tb?clientID=audit-race"' | sort | uniq -c
+```
+
+Forty unique client IDs, alternating between instances:
+
+```bash
+seq 1 40 | xargs -P 20 -I{} sh -c 'if [ $(({} % 2)) -eq 1 ]; then port=3000; else port=3001; fi; curl --max-time 10 -sS -o /dev/null -w "%{http_code}\n" "http://localhost:${port}/tb?clientID=audit-client-{}"' | sort | uniq -c
+```
+
+Inspect a client's stored hash and expiry, the key count, memory, and replication status:
+
+```bash
+redis-cli HGETALL rate-limiter:user1
+redis-cli TTL rate-limiter:user1
+redis-cli DBSIZE
+redis-cli INFO memory
+redis-cli INFO replication
+```
+
+#### Observed test output
+
+![Lua-based distributed rate limiter test across both servers and Redis memory](./assets/Post_lua.png)
+
+The alternating run shared one bucket across both instances:
+
+```text
+seq01 server.js  200
+seq02 Replica.js 200
+seq03 server.js  200
+seq04 Replica.js 200
+seq05 server.js  200
+seq06 Replica.js 429
+seq07 server.js  429
+seq08 Replica.js 429
+seq09 server.js  429
+seq10 Replica.js 429
+seq11 server.js  429
+seq12 Replica.js 429
+```
+
+The concurrent run returned `7 x 200` and `93 x 429`; the count of successful requests can vary slightly with elapsed time because of token refill during the burst. All 40 unique-client requests returned `200`. Redis memory at that point was:
+
+```text
+used_memory_human: 1.17M
+used_memory_peak_human: 1.21M
+maxmemory_human: 0B
+```
+
+`maxmemory_human: 0B` means Redis has no configured memory limit. These results exercise the implementation but are not a formal proof of correctness under every production failure mode.
 
 
 ---

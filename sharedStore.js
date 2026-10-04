@@ -1,4 +1,6 @@
 const { createClient } = require('redis');
+const fs = require('fs');
+const path = require('path');
 
 const client = createClient();
 
@@ -39,7 +41,6 @@ client.on('end', () => {
     console.log('[Redis] Connection closed');
 });
 
-// Connect to Redis on module load
 (async () => {
     try {
         await client.connect();
@@ -48,10 +49,6 @@ client.on('end', () => {
     }
 })();
 
-/**
- * Get user state from Redis
- * Returns { totalTokens, lastRefillTime } or null if user doesn't exist
- */
 async function getUserState(clientID) {
     try {
         const key = `rate-limiter:${clientID}`;
@@ -74,10 +71,6 @@ async function getUserState(clientID) {
     }
 }
 
-/**
- * Set user state in Redis
- * Stores { totalTokens, lastRefillTime } for a user
- */
 async function setUserState(clientID, totalTokens, lastRefillTime) {
     try {
         const key = `rate-limiter:${clientID}`;
@@ -92,10 +85,6 @@ async function setUserState(clientID, totalTokens, lastRefillTime) {
     }
 }
 
-/**
- * Initialize user state if doesn't exist
- * Returns true if initialized, false if already existed
- */
 async function initializeUserIfNotExists(clientID, bucketSize, now) {
     try {
         const existing = await getUserState(clientID);
@@ -112,9 +101,28 @@ async function initializeUserIfNotExists(clientID, bucketSize, now) {
     }
 }
 
-/**
- * Check if Redis is connected
- */
+const TOKEN_BUCKET_SCRIPT = fs.readFileSync(
+    path.join(__dirname, 'scripts', 'tokenBucketCheck.lua'),
+    'utf-8'
+);
+
+async function rateLimitCheck(clientID, bucketSize, refillRate) {
+    const key = `rate-limiter:${clientID}`;
+    const now = Date.now();
+
+    const result = await client.eval(TOKEN_BUCKET_SCRIPT, {
+        keys: [key],
+        arguments: [bucketSize.toString(), refillRate.toString(), now.toString()],
+    });
+
+    const allowed = result[0] === 1;
+    const tokensRemaining = parseFloat(result[1]);
+
+    console.log(`[Redis] EVAL key=${key} allowed=${allowed} tokensRemaining=${tokensRemaining}`);
+
+    return { allowed, tokensRemaining };
+}
+
 function isStoreConnected() {
     return client.isReady;
 }
@@ -124,5 +132,7 @@ module.exports = {
     setUserState,
     initializeUserIfNotExists,
     isStoreConnected,
+    rateLimitCheck,
     client,
 };
+
